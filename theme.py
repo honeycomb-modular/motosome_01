@@ -12,29 +12,34 @@ import os
 from PySide6 import QtGui
 
 # --- palette ---------------------------------------------------------------
-BG        = "#0E0F13"   # canvas / near-black
-PANEL     = "#15171D"   # group panels
-PANEL_HI  = "#1B1E26"   # buttons / raised
-BORDER    = "#262A33"   # hairlines
-GRID      = "#1C2029"   # scope grid
-ZERO      = "#3A404C"   # scope zero line
-TEXT      = "#C9CDD6"   # primary text (matches the recoloured logo)
-TEXT_DIM  = "#6A7180"   # labels / secondary
-SIGNAL    = "#39C5BB"   # primary instrument accent (phosphor teal)
+# Exact tokens from xylosome-hmi  pi/hmi/qml/Theme.qml
+BG         = "#050505"   # Theme.bg     — canvas
+PANEL      = "#0E0E0E"   # Theme.panel
+PANEL_HI   = "#141414"   # raised (buttons)
+BORDER     = "#262626"   # Theme.border — hairlines
+BORDER_DIM = "#1A1A1A"   # Theme.borderDim
+GRID       = "#1A1A1A"   # scope / curve grid
+ZERO       = "#2E2E2E"   # zero line
+TEXT       = "#ECECEC"   # Theme.colorText      — primary
+TEXT_DIM   = "#888888"   # Theme.colorTextDim   — secondary
+TEXT_FAINT = "#4A4A4A"   # Theme.colorTextFaint — tertiary
+SIGNAL     = "#4ADE80"   # Theme.accent     — active / live / OK · curves, nodes, traces
+ACCENT_DIM = "#1F6E3A"   # Theme.accentDim
+ACTION     = "#F87171"   # Theme.danger     — offline / error / play-stop
 
-# functional scan-channel colours (Xylosome R / G / B / C)
-CH_R = "#E5484D"
-CH_G = "#46C26B"
+# functional scan-channel colours (R / G / B / C) for later channel UI
+CH_R = "#F87171"
+CH_G = "#4ADE80"
 CH_B = "#3B82F6"
-CH_C = "#E6E6E6"
+CH_C = "#ECECEC"
 
-OK    = "#39C5BB"
-WARN  = "#E5A23B"
-FAULT = "#E5484D"
-IDLE  = "#6A7180"
+OK    = "#4ADE80"
+WARN  = "#F87171"
+FAULT = "#F87171"
+IDLE  = "#4A4A4A"
 
-# preferred monospace stack (DejaVu Sans Mono ships with Ubuntu)
-FONT_FAMILIES = ["JetBrains Mono", "DejaVu Sans Mono", "Menlo", "Consolas", "monospace"]
+# Matches Theme.fontFamily in the HMI (Courier New → DejaVu Sans Mono → monospace)
+FONT_FAMILIES = ["Courier New", "Courier", "DejaVu Sans Mono", "Liberation Mono", "monospace"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(HERE, "logo_light.svg")
@@ -65,13 +70,15 @@ def stylesheet() -> str:
     }}
     QPushButton {{
         background: {PANEL_HI};
-        border: 1px solid {BORDER};
+        border: 1px solid {SIGNAL};
         padding: 6px 10px;
         color: {TEXT};
     }}
-    QPushButton:hover  {{ border-color: {SIGNAL}; }}
+    QPushButton:hover  {{ border-color: {SIGNAL}; color: {SIGNAL}; }}
     QPushButton:pressed {{ background: {BORDER}; }}
     QPushButton:checked {{ border-color: {SIGNAL}; color: {SIGNAL}; }}
+    QPushButton[role="action"] {{ border-color: {ACTION}; color: {ACTION}; }}
+    QPushButton[role="action"]:hover {{ border-color: {ACTION}; color: {ACTION}; }}
     QComboBox, QDoubleSpinBox {{
         background: {BG};
         border: 1px solid {BORDER};

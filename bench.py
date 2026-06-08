@@ -21,7 +21,8 @@ from collections import deque
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from drive import SimDrive, SoemDrive, DriveLimits, DriveState, Mode
-from profile import Profile, ProfileRunner
+from profile import Profile, ProfileRunner, Smoother
+from curve_editor import CurveEditor
 import theme
 
 # Update rate of the GUI loop / sim integration
@@ -122,6 +123,9 @@ class BenchWindow(QtWidgets.QMainWindow):
         right = QtWidgets.QVBoxLayout()
         body.addLayout(right, 1)
 
+        # the editable speed curve (created early so the Span control can bind to it)
+        self.curve = CurveEditor(span=3.0)
+
         # --- connection ---
         conn = QtWidgets.QGroupBox("Connection")
         cl = QtWidgets.QGridLayout(conn)
@@ -173,6 +177,7 @@ class BenchWindow(QtWidgets.QMainWindow):
         run_btn.clicked.connect(lambda: self.drive.command_velocity(self._counts(self.vel_target.value())))
         stop_btn = QtWidgets.QPushButton("Stop")
         stop_btn.clicked.connect(lambda: self.drive.stop())
+        stop_btn.setProperty("role", "action")
         vlay.addWidget(QtWidgets.QLabel("Target"), 0, 0)
         vlay.addWidget(self.vel_target, 0, 1)
         vlay.addWidget(run_btn, 1, 0)
@@ -193,28 +198,50 @@ class BenchWindow(QtWidgets.QMainWindow):
         play.addWidget(home_btn, 1, 1)
         controls.addWidget(pos)
 
-        # --- profile ---
-        prof = QtWidgets.QGroupBox("Speed profile")
+        # --- speed curve ---
+        prof = QtWidgets.QGroupBox("Speed curve")
         prl = QtWidgets.QGridLayout(prof)
+        self.prof_span = self._spin(3.0, 0.5, 120.0, " s")
+        self.prof_span.valueChanged.connect(lambda val: self.curve.set_span(val))
+        self.prof_kind = QtWidgets.QComboBox()
+        self.prof_kind.addItems(["Trapezoid", "Sine sweep"])
         self.prof_peak = self._spin(8.0, 0.0, 50.0, " rev/s")
         self.prof_ramp = self._spin(0.4, 0.0, 10.0, " s")
         self.prof_hold = self._spin(1.0, 0.0, 60.0, " s")
-        self.prof_kind = QtWidgets.QComboBox()
-        self.prof_kind.addItems(["Trapezoid", "Sine sweep"])
-        self.play_btn = QtWidgets.QPushButton("▶ Play")
+        load_btn = QtWidgets.QPushButton("Load preset → editor")
+        load_btn.clicked.connect(self._on_load_preset)
+        self.play_btn = QtWidgets.QPushButton("▶ Play curve")
         self.play_btn.clicked.connect(self._on_play)
+        self.play_btn.setProperty("role", "action")
         pstop = QtWidgets.QPushButton("■ Stop")
         pstop.clicked.connect(self._on_profile_stop)
-        prl.addWidget(QtWidgets.QLabel("Shape"), 0, 0); prl.addWidget(self.prof_kind, 0, 1)
-        prl.addWidget(QtWidgets.QLabel("Peak"), 1, 0); prl.addWidget(self.prof_peak, 1, 1)
-        prl.addWidget(QtWidgets.QLabel("Ramp"), 2, 0); prl.addWidget(self.prof_ramp, 2, 1)
-        prl.addWidget(QtWidgets.QLabel("Hold"), 3, 0); prl.addWidget(self.prof_hold, 3, 1)
-        prl.addWidget(self.play_btn, 4, 0); prl.addWidget(pstop, 4, 1)
+        pstop.setProperty("role", "action")
+        prl.addWidget(QtWidgets.QLabel("Span"), 0, 0); prl.addWidget(self.prof_span, 0, 1)
+        prl.addWidget(QtWidgets.QLabel("Preset"), 1, 0); prl.addWidget(self.prof_kind, 1, 1)
+        prl.addWidget(QtWidgets.QLabel("Peak"), 2, 0); prl.addWidget(self.prof_peak, 2, 1)
+        prl.addWidget(QtWidgets.QLabel("Ramp"), 3, 0); prl.addWidget(self.prof_ramp, 3, 1)
+        prl.addWidget(QtWidgets.QLabel("Hold"), 4, 0); prl.addWidget(self.prof_hold, 4, 1)
+        prl.addWidget(load_btn, 5, 0, 1, 2)
+        prl.addWidget(self.play_btn, 6, 0); prl.addWidget(pstop, 6, 1)
         controls.addWidget(prof)
+
+        # --- smoothing (make the drawn curve physically followable) ---
+        sm = QtWidgets.QGroupBox("Smoothing")
+        sml = QtWidgets.QGridLayout(sm)
+        self.sm_accel = self._spin(25.0, 0.0, 2000.0, " rev/s²")
+        self.sm_jerk = self._spin(0.0, 0.0, 20000.0, " rev/s³")
+        hint = QtWidgets.QLabel("jerk 0 = accel-clamp · jerk > 0 = S-curve")
+        hint.setStyleSheet(f"color:{theme.TEXT_DIM};")
+        hint.setFont(theme.font(8))
+        sml.addWidget(QtWidgets.QLabel("Max accel"), 0, 0); sml.addWidget(self.sm_accel, 0, 1)
+        sml.addWidget(QtWidgets.QLabel("Max jerk"), 1, 0); sml.addWidget(self.sm_jerk, 1, 1)
+        sml.addWidget(hint, 2, 0, 1, 2)
+        controls.addWidget(sm)
 
         controls.addStretch(1)
 
-        # --- right: scope + readouts ---
+        # --- right: editable curve (draw) over the live scope (watch it run) ---
+        right.addWidget(self.curve, 1)
         self.scope = Scope()
         right.addWidget(self.scope, 1)
 
@@ -235,7 +262,7 @@ class BenchWindow(QtWidgets.QMainWindow):
             rl.addWidget(lbl, i, 1)
         right.addWidget(read, 0)
 
-        self.resize(900, 560)
+        self.resize(1000, 760)
 
     def _make_header(self) -> QtWidgets.QWidget:
         bar = QtWidgets.QWidget()
@@ -311,16 +338,24 @@ class BenchWindow(QtWidgets.QMainWindow):
             self.drive.disconnect()
             self.connect_btn.setText("Connect")
 
-    def _on_play(self):
-        kind = self.prof_kind.currentText()
-        if kind == "Trapezoid":
-            prof = Profile.trapezoid(self.prof_peak.value(),
+    def _preset_profile(self) -> Profile:
+        if self.prof_kind.currentText() == "Trapezoid":
+            return Profile.trapezoid(self.prof_peak.value(),
                                      self.prof_ramp.value(),
                                      self.prof_hold.value())
-        else:
-            prof = Profile.sine_sweep(self.prof_peak.value(),
-                                      period_s=max(0.2, 2 * self.prof_ramp.value() + self.prof_hold.value()))
-        self.runner = ProfileRunner(self.drive, prof, self.limits.counts_per_rev)
+        return Profile.sine_sweep(self.prof_peak.value(),
+                                  period_s=max(0.2, 2 * self.prof_ramp.value() + self.prof_hold.value()))
+
+    def _on_load_preset(self):
+        self.curve.load_preset(self._preset_profile())
+        self.prof_span.blockSignals(True)
+        self.prof_span.setValue(self.curve.span)
+        self.prof_span.blockSignals(False)
+
+    def _on_play(self):
+        smoother = Smoother(self.sm_accel.value(), self.sm_jerk.value())
+        self.runner = ProfileRunner(self.drive, self.curve.profile(),
+                                    self.limits.counts_per_rev, smoother=smoother)
         self.runner.start(time.monotonic())
 
     def _on_profile_stop(self):
