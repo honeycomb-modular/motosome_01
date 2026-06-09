@@ -242,83 +242,305 @@ class SimDrive(MotionDrive):
 
 
 # ----------------------------------------------------------------------------
-# Real EtherCAT / CiA402 backend  (skeleton - filled in with hardware)
+# Real EtherCAT / CiA402 backend  (SOEM)
 # ----------------------------------------------------------------------------
+# CiA402 modes of operation (object 0x6060)
+_MODE_CSP = 8   # cyclic synchronous position
+_MODE_CSV = 9   # cyclic synchronous velocity
+_MODE_HM = 6    # homing
+
+# CiA402 controlword commands
+_CW_SHUTDOWN = 0x0006
+_CW_SWITCH_ON = 0x0007
+_CW_ENABLE_OP = 0x000F
+_CW_FAULT_RESET = 0x0080
+
+
+@dataclass
+class CiA402Pdo:
+    """Byte offsets (little-endian) within the process image.
+
+    Defaults match the explicit mapping set in SoemDrive._setup_pdos():
+      RxPDO 0x1600: controlword(16) modes(8) target_pos(32) target_vel(32)  -> 11 B
+      TxPDO 0x1A00: statusword(16) modes_disp(8) actual_pos(32) actual_vel(32) -> 11 B
+    If the A6-EC uses fixed/other PDOs, set these to what `soem_scan.py` reports.
+    """
+    out_controlword: int = 0
+    out_mode: int = 2
+    out_target_pos: int = 3
+    out_target_vel: int = 7
+    out_len: int = 11
+    in_statusword: int = 0
+    in_mode_disp: int = 2
+    in_actual_pos: int = 3
+    in_actual_vel: int = 7
+    in_len: int = 11
+
+
 class SoemDrive(MotionDrive):
+    """SOEM EtherCAT master + CiA402 servo backbone (the A6-EC scan axis).
+
+    Opens the bus, maps a standard CiA402 PDO set, brings the slave to OP, and
+    runs a cyclic thread that drives the CiA402 state machine and exchanges
+    target/actual values. The GUI talks to it through the same MotionDrive
+    interface as the simulator — so selecting "EtherCAT" in the bench and hitting
+    Enable / jog / Play drives the real motor with zero GUI changes.
+
+    Bring-up (when the drive arrives):
+      1. pip install --user pysoem ; run the bench with CAP_NET_RAW (or sudo) on enp4s0
+      2. python3 soem_scan.py enp4s0   -> confirm the drive's vendor/product + PDO sizes
+      3. if its process image differs from CiA402Pdo's defaults, adjust the offsets
+         (and _setup_pdos if the drive allows PDO remapping; some use fixed PDOs)
+      4. calibrate the counts<->drive-units factor if 0x60FF/0x6064 aren't in counts
+
+    NOTE: written against the standard CiA402 profile but UNTESTED on hardware yet —
+    expect a short calibration pass on first connect.
     """
-    SOEM-based CiA402 master for a StepperOnline EtherCAT servo.
 
-    This is intentionally a SKELETON: the structure, threading model and CiA402
-    state machine are laid out, but the PDO mapping and object indices are marked
-    TODO because they come from the specific drive's ESI/manual. With the drive on
-    the bus, we (1) confirm `slaveinfo` sees it, (2) fill in the PDO map, (3) test
-    each method against real hardware - the GUI above never changes.
-
-    Requires:  pip install pysoem   (and run with CAP_NET_RAW / sudo, on enp4s0)
-    """
-
-    # CiA402 object dictionary (standard indices) ----------------------------
-    OD_CONTROLWORD = 0x6040
-    OD_STATUSWORD = 0x6041
-    OD_MODES_OF_OPERATION = 0x6060
-    OD_TARGET_VELOCITY = 0x60FF   # CSV
-    OD_TARGET_POSITION = 0x607A   # CSP
-    OD_ACTUAL_POSITION = 0x6064
-    OD_ACTUAL_VELOCITY = 0x606C
-
-    # CiA402 controlword command sequence to reach "Operation enabled"
-    CW_SHUTDOWN = 0x0006
-    CW_SWITCH_ON = 0x0007
-    CW_ENABLE_OPERATION = 0x000F
-    CW_FAULT_RESET = 0x0080
-
-    def __init__(self, ifname: str = "enp4s0", limits: DriveLimits | None = None):
+    def __init__(self, ifname: str = "enp4s0", limits: DriveLimits | None = None,
+                 cycle_us: int = 1000, pdo: CiA402Pdo | None = None):
         super().__init__(limits)
         self.ifname = ifname
+        self.cycle_us = cycle_us
+        self.pdo = pdo or CiA402Pdo()
+        self._pysoem = None
         self._master = None
         self._slave = None
-        self._cycle_thread: threading.Thread | None = None
+        self._thread: threading.Thread | None = None
         self._running = False
         self._lock = threading.Lock()
-        self._status = DriveStatus()
+        # shared command state (GUI thread -> cyclic thread)
+        self._mode = Mode.VELOCITY
+        self._want_enable = False
+        self._reset_req = False
+        self._target_vel = 0.0   # counts/s
+        self._target_pos = 0.0   # counts
+        self._homing = False
+        # shared feedback (cyclic thread -> GUI thread)
+        self._state = DriveState.DISCONNECTED
+        self._pos = 0.0
+        self._vel = 0.0
+        self._homed = False
+        self._fault = ""
 
+    # ---- lifecycle ------------------------------------------------------
     def connect(self) -> None:
-        # import pysoem  # deferred until hardware is present
-        # self._master = pysoem.Master(); self._master.open(self.ifname)
-        # if self._master.config_init() <= 0: raise RuntimeError("no slaves found")
-        # self._slave = self._master.slaves[0]
-        # TODO: map PDOs (controlword, statusword, target/actual pos+vel) per ESI
-        # self._master.config_map(); self._master.state = pysoem.OP_STATE; ...
-        # self._start_cycle_thread()
-        raise NotImplementedError(
-            "SoemDrive is a skeleton. Connect the StepperOnline drive, run "
-            "slaveinfo, then fill in PDO mapping + the cyclic loop."
-        )
+        try:
+            import pysoem
+        except ImportError as e:
+            raise RuntimeError("pysoem not installed — run: pip install --user pysoem") from e
+        self._pysoem = pysoem
+        m = pysoem.Master()
+        m.open(self.ifname)
+        if m.config_init() <= 0:
+            m.close()
+            raise RuntimeError(f"no EtherCAT slaves found on {self.ifname}")
+        self._slave = m.slaves[0]
+        self._slave.config_func = self._setup_pdos
+        m.config_map()
+        m.config_dc()
+        self._master = m
+        if m.state_check(pysoem.SAFEOP_STATE, 50000) != pysoem.SAFEOP_STATE:
+            self._fail("slave did not reach SAFE_OP")
+        # prime process data, then request OP
+        self._slave.output = bytes(self.pdo.out_len)
+        m.send_processdata(); m.receive_processdata(2000)
+        m.state = pysoem.OP_STATE
+        m.write_state()
+        for _ in range(200):
+            m.send_processdata(); m.receive_processdata(2000)
+            if m.state_check(pysoem.OP_STATE, 5000) == pysoem.OP_STATE:
+                break
+        if m.state_check(pysoem.OP_STATE, 5000) != pysoem.OP_STATE:
+            self._fail("slave did not reach OP")
+        with self._lock:
+            self._state = DriveState.DISABLED
+        self._running = True
+        self._thread = threading.Thread(target=self._cyclic, daemon=True)
+        self._thread.start()
+
+    def _fail(self, msg: str) -> None:
+        try:
+            if self._master:
+                self._master.close()
+        finally:
+            self._master = None
+        raise RuntimeError(msg)
 
     def disconnect(self) -> None:
         self._running = False
-        if self._cycle_thread:
-            self._cycle_thread.join(timeout=1.0)
-        # if self._master: self._master.close()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        if self._master:
+            try:
+                self._master.state = self._pysoem.INIT_STATE
+                self._master.write_state()
+            except Exception:
+                pass
+            self._master.close()
+            self._master = None
+        with self._lock:
+            self._state = DriveState.DISCONNECTED
 
-    def _cyclic_loop(self) -> None:
-        """Runs at the bus cycle (e.g. 1 kHz). Exchange PDOs, run state machine."""
+    # ---- PDO mapping (invoked by config_map while in PRE_OP) ------------
+    def _setup_pdos(self, slave_pos: int) -> int:
+        import struct
+        s = self._slave
+
+        def w(idx, sub, val, fmt):
+            s.sdo_write(idx, sub, struct.pack(fmt, val))
+
+        try:
+            # RxPDO 0x1600: CW(0x6040,16) MODE(0x6060,8) TPOS(0x607A,32) TVEL(0x60FF,32)
+            w(0x1C12, 0, 0, "B")
+            w(0x1600, 0, 0, "B")
+            w(0x1600, 1, 0x60400010, "<I")
+            w(0x1600, 2, 0x60600008, "<I")
+            w(0x1600, 3, 0x607A0020, "<I")
+            w(0x1600, 4, 0x60FF0020, "<I")
+            w(0x1600, 0, 4, "B")
+            w(0x1C12, 1, 0x1600, "<H")
+            w(0x1C12, 0, 1, "B")
+            # TxPDO 0x1A00: SW(0x6041,16) MODEd(0x6061,8) APOS(0x6064,32) AVEL(0x606C,32)
+            w(0x1C13, 0, 0, "B")
+            w(0x1A00, 0, 0, "B")
+            w(0x1A00, 1, 0x60410010, "<I")
+            w(0x1A00, 2, 0x60610008, "<I")
+            w(0x1A00, 3, 0x60640020, "<I")
+            w(0x1A00, 4, 0x606C0020, "<I")
+            w(0x1A00, 0, 4, "B")
+            w(0x1C13, 1, 0x1A00, "<H")
+            w(0x1C13, 0, 1, "B")
+        except Exception as e:  # drive may use fixed PDOs
+            print(f"[SoemDrive] PDO remap skipped ({e}); using drive default PDOs — "
+                  f"verify offsets with soem_scan.py")
+        return 0
+
+    # ---- commanding (GUI thread) ---------------------------------------
+    def enable(self) -> None:
+        with self._lock:
+            self._want_enable = True
+
+    def disable(self) -> None:
+        with self._lock:
+            self._want_enable = False
+
+    def reset_fault(self) -> None:
+        with self._lock:
+            self._reset_req = True
+
+    def set_mode(self, mode: Mode) -> None:
+        with self._lock:
+            self._mode = mode
+
+    def command_velocity(self, counts_per_s: float) -> None:
+        mv = self.limits.max_velocity
+        with self._lock:
+            self._mode = Mode.VELOCITY
+            self._homing = False
+            self._target_vel = max(-mv, min(mv, counts_per_s))
+
+    def command_position(self, counts: float) -> None:
+        with self._lock:
+            self._mode = Mode.POSITION
+            self._homing = False
+            self._target_pos = counts
+
+    def stop(self) -> None:
+        with self._lock:
+            self._homing = False
+            if self._mode == Mode.VELOCITY:
+                self._target_vel = 0.0
+            else:
+                self._target_pos = self._pos
+
+    def home(self) -> None:
+        # Backbone homing: drive to absolute zero in CSP, flag homed when settled.
+        # (True CiA402 homing = mode 6 + the drive's configured homing method/switch.)
+        with self._lock:
+            self._mode = Mode.POSITION
+            self._homing = True
+            self._homed = False
+            self._target_pos = 0.0
+
+    # ---- cyclic real-time loop -----------------------------------------
+    def _cyclic(self) -> None:
+        import struct
+        p = self.pdo
+        period = self.cycle_us / 1_000_000.0
+        out = bytearray(p.out_len)
+        next_t = time.perf_counter()
         while self._running:
-            # self._master.send_processdata(); self._master.receive_processdata(2000)
-            # read statusword/actual pos+vel from input PDOs, write controlword +
-            # target from a shared command, advance CiA402 state machine.
-            time.sleep(0.001)
+            self._master.send_processdata()
+            self._master.receive_processdata(2000)
+            data = bytes(self._slave.input)
 
-    # The commanding/feedback methods set shared fields the cyclic loop consumes.
-    def enable(self) -> None: raise NotImplementedError
-    def disable(self) -> None: raise NotImplementedError
-    def reset_fault(self) -> None: raise NotImplementedError
-    def set_mode(self, mode: Mode) -> None: raise NotImplementedError
-    def command_velocity(self, counts_per_s: float) -> None: raise NotImplementedError
-    def command_position(self, counts: float) -> None: raise NotImplementedError
-    def stop(self) -> None: raise NotImplementedError
-    def home(self) -> None: raise NotImplementedError
+            sw = struct.unpack_from("<H", data, p.in_statusword)[0] if len(data) >= p.in_len else 0
+            apos = struct.unpack_from("<i", data, p.in_actual_pos)[0] if len(data) >= p.in_len else 0
+            avel = struct.unpack_from("<i", data, p.in_actual_vel)[0] if len(data) >= p.in_len else 0
 
+            with self._lock:
+                mode, want = self._mode, self._want_enable
+                tvel, tpos = self._target_vel, self._target_pos
+                do_reset = self._reset_req
+                self._reset_req = False
+                homing = self._homing
+
+            cw, dstate = self._step_state(sw, want, do_reset)
+
+            mode_byte = _MODE_CSV if mode == Mode.VELOCITY else _MODE_CSP
+            struct.pack_into("<H", out, p.out_controlword, cw)
+            struct.pack_into("B", out, p.out_mode, mode_byte)
+            struct.pack_into("<i", out, p.out_target_pos, int(tpos))
+            struct.pack_into("<i", out, p.out_target_vel,
+                             int(tvel) if mode == Mode.VELOCITY else 0)
+            self._slave.output = bytes(out)
+
+            homed_now = homing and abs(apos) < 5 and abs(avel) < 5
+            with self._lock:
+                self._pos, self._vel = float(apos), float(avel)
+                self._state = dstate
+                self._fault = "drive fault" if dstate == DriveState.FAULT else ""
+                if homed_now:
+                    self._homed = True
+                    self._homing = False
+
+            next_t += period
+            dt = next_t - time.perf_counter()
+            if dt > 0:
+                time.sleep(dt)
+            else:
+                next_t = time.perf_counter()
+
+    @staticmethod
+    def _walk_to_enabled(sw: int) -> tuple[int, "DriveState"]:
+        if (sw & 0x4F) == 0x40:      # switch-on disabled
+            return _CW_SHUTDOWN, DriveState.DISABLED
+        if (sw & 0x6F) == 0x21:      # ready to switch on
+            return _CW_SWITCH_ON, DriveState.DISABLED
+        if (sw & 0x6F) == 0x23:      # switched on
+            return _CW_ENABLE_OP, DriveState.DISABLED
+        if (sw & 0x6F) == 0x27:      # operation enabled
+            return _CW_ENABLE_OP, DriveState.ENABLED
+        return _CW_SHUTDOWN, DriveState.DISABLED
+
+    def _step_state(self, sw: int, want_enable: bool, do_reset: bool):
+        """CiA402 state machine -> (controlword, DriveState)."""
+        if (sw & 0x4F) == 0x08:                      # fault
+            if do_reset:
+                return _CW_FAULT_RESET, DriveState.FAULT   # one-cycle rising-edge pulse
+            return _CW_SHUTDOWN, DriveState.FAULT
+        if not want_enable:
+            return _CW_SHUTDOWN, DriveState.DISABLED
+        return self._walk_to_enabled(sw)
+
+    # ---- feedback (GUI thread) -----------------------------------------
     def status(self) -> DriveStatus:
         with self._lock:
-            return self._status
+            return DriveStatus(
+                state=self._state, mode=self._mode,
+                actual_position=self._pos, actual_velocity=self._vel,
+                target_position=self._target_pos, target_velocity=self._target_vel,
+                homed=self._homed, fault_text=self._fault,
+            )

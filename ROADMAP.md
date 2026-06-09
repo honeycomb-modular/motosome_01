@@ -10,7 +10,8 @@ and the decisions/context behind them so we can pick up cold.
 - Beckhoff **C6920** running Ubuntu 26.04 + XFCE, static IP `192.168.2.2`, passwordless SSH.
 - Test bench app (`bench.py`): connect / enable / **jog** / run-at-speed / move-to-position /
   home / **speed-profile player** (trapezoid + sine) with a live velocity scope.
-- Clean **drive abstraction** (`drive.py`): `SimDrive` (works now) + `SoemDrive` (skeleton).
+- Clean **drive abstraction** (`drive.py`): `SimDrive` (works now) + `SoemDrive` (SOEM/CiA402
+  backbone — full state machine + cyclic loop written; needs a calibration pass on real HW).
 - Speed/position-vs-time **profiles** (`profile.py`).
 - **House style** (`theme.py` + `logo_light.svg`): dark instrument look, monospace, honeycomb-modular logo.
 - Published: github.com/honeycomb-modular/motosome_01
@@ -27,15 +28,21 @@ Replace the trapezoid/sine *presets* with a real **drawable** speed-(or position
 - Toggle: velocity-curve vs position-curve (`ProfileKind` already supports both).
 - Save / load curves to file (JSON). Add a small library of saved profiles.
 
-### 2. Wire the real SOEM backend  ← when the StepperOnline drive is on the bench
-- Hardware: drive on the Beckhoff's **2nd NIC `enp4s0`** over EtherCAT, motor connected.
-- `pip install --user pysoem`; confirm the bus with SOEM's `slaveinfo`.
-- Fill in `SoemDrive` in `drive.py`: PDO mapping + cyclic loop from the drive's **ESI/manual**
-  (CiA402 object indices + controlword/statusword constants are already stubbed).
-- Set `counts_per_rev` (in `theme`/`DriveLimits`) to the drive's encoder / electronic-gear value.
-- Run with raw-socket rights: `sudo python3 bench.py` or grant `CAP_NET_RAW`.
-- Real homing: implement CiA402 homing modes (sim currently just drives to 0).
-- Decode and surface the **statusword** (fault details, ready/switched-on/op-enabled).
+### 2. SOEM backend — WRITTEN, needs hardware calibration  ← when the A6-EC is on the bench
+`SoemDrive` in `drive.py` is the real backbone now: opens the bus, maps a standard CiA402
+PDO set, brings the slave to OP, runs a 1 kHz cyclic thread with the full CiA402 state
+machine (CSV jog/curve + CSP move/home). `soem_scan.py` is the first-contact diagnostic.
+Bring-up when the drive arrives:
+- Drive on the Beckhoff's **2nd NIC `enp4s0`** over EtherCAT, motor connected.
+- `pip install --user pysoem`; run `sudo python3 soem_scan.py enp4s0` — confirm vendor/product
+  and the RxPDO/TxPDO byte sizes.
+- If the process image differs from `drive.CiA402Pdo` defaults (11 B / 11 B), adjust the offsets
+  there (and `_setup_pdos` if the A6-EC allows PDO remapping; some drives use fixed PDOs).
+- Set `counts_per_rev` (`DriveLimits`) to the drive's encoder / electronic-gear value, and
+  calibrate the counts↔drive-units factor if `0x60FF`/`0x6064` aren't already in counts.
+- Run the bench with raw-socket rights: `sudo python3 bench.py` or `setcap cap_net_raw`.
+- Still simplified vs production: homing drives to absolute 0 (real CiA402 homing = mode 6 +
+  the drive's homing method/switch); statusword fault text is generic ("drive fault").
 
 ### 3. Real-time / low-latency kernel
 - Needed for jitter-free cyclic EtherCAT once we're driving real motion (not for sim/jog).

@@ -329,10 +329,10 @@ class BenchWindow(QtWidgets.QMainWindow):
             try:
                 self.drive.connect()
                 self.connect_btn.setText("Disconnect")
-            except NotImplementedError as e:
+            except Exception as e:
                 self.connect_btn.setChecked(False)
-                QtWidgets.QMessageBox.information(
-                    self, "Hardware backend not wired yet", str(e))
+                QtWidgets.QMessageBox.warning(
+                    self, "EtherCAT connect failed", str(e))
                 self.drive = SimDrive(self.limits)
         else:
             self.drive.disconnect()
