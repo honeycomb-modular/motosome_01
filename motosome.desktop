@@ -1,0 +1,13 @@
+[Desktop Entry]
+# Desktop launcher for the motosome bench (XFCE on the Beckhoff).
+# Install:
+#   cp motosome.desktop ~/.local/share/applications/   # app-menu entry
+#   cp motosome.desktop ~/Desktop/ && chmod +x ~/Desktop/motosome.desktop
+# Assumes the repo is at ~/motosome_01.
+Type=Application
+Name=Motosome Bench
+Comment=EtherCAT servo test bench
+Exec=sh -c "cd $HOME/motosome_01 && python3 bench.py"
+Icon=logo_light
+Terminal=false
+Categories=Utility;Development;
