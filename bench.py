@@ -21,6 +21,7 @@ from collections import deque
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from drive import SimDrive, SoemDrive, DriveLimits, DriveState, Mode
+from xylod_link import XylodDrive
 from profile import Profile, ProfileRunner, Smoother
 from curve_editor import CurveEditor
 import theme
@@ -130,7 +131,8 @@ class BenchWindow(QtWidgets.QMainWindow):
         conn = QtWidgets.QGroupBox("Connection")
         cl = QtWidgets.QGridLayout(conn)
         self.backend_box = QtWidgets.QComboBox()
-        self.backend_box.addItems(["Simulated", "EtherCAT (enp4s0)"])
+        self.backend_box.addItems(["Simulated", "EtherCAT (enp4s0)",
+                                   "Xylosome xylod (live)"])
         self.connect_btn = QtWidgets.QPushButton("Connect")
         self.connect_btn.setCheckable(True)
         self.connect_btn.clicked.connect(self._on_connect)
@@ -322,8 +324,13 @@ class BenchWindow(QtWidgets.QMainWindow):
     # --------------------------------------------------------------- slots
     def _on_connect(self, checked):
         if checked:
-            if self.backend_box.currentIndex() == 1:
+            idx = self.backend_box.currentIndex()
+            if idx == 1:
                 self.drive = SoemDrive("enp4s0", self.limits)
+            elif idx == 2:
+                # live view of the Xylosome daemon - scan-axis output degrees,
+                # so 1 bench rev = 1 output revolution (counts_per_rev maps it)
+                self.drive = XylodDrive(self.limits)
             else:
                 self.drive = SimDrive(self.limits)
             try:
@@ -332,7 +339,7 @@ class BenchWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 self.connect_btn.setChecked(False)
                 QtWidgets.QMessageBox.warning(
-                    self, "EtherCAT connect failed", str(e))
+                    self, "Connect failed", str(e))
                 self.drive = SimDrive(self.limits)
         else:
             self.drive.disconnect()
