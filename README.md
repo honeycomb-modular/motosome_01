@@ -14,6 +14,7 @@ controls drive the real motor — the GUI never changes.
 | `bench.py` | The GUI (PySide6). Run this. |
 | `drive.py` | The drive abstraction + `SimDrive` (simulator) + `SoemDrive` (real EtherCAT skeleton). |
 | `profile.py` | Speed/position-vs-time profiles (the "draw a curve and play it" part). |
+| `xylod_link.py` | Third backend: live link to the Xylosome daemon (xylod :5510). Select "Xylosome xylod (live)" → the scope shows the scan axis in real time while the Pi pendant executes — and the bench controls drive the axis through xylod. |
 
 The whole app only ever talks to the `MotionDrive` interface, so sim ↔ hardware is a
 one-line backend swap.
