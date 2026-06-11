@@ -47,6 +47,13 @@ class XylodDrive(MotionDrive):
         self._fault = ""
         self._xstate = "offline"      # xylod state string (running/settle/...)
         self._pass = -1
+        # Xylosome scan context (from status pushes + pass events)
+        self._progress = 0.0
+        self._line_hz = 0.0
+        self._filter_slot = -1
+        self._estop_ok = True
+        self._pass_filter = ""        # "R"/"G"/"B"/"C" from the pass_start event
+        self._seq_passes = 0          # passes completed in the last finished sequence
         # last value WE commanded (for the scope's target trace)
         self._target_vel = 0.0
         self._target_pos = 0.0
@@ -132,7 +139,11 @@ class XylodDrive(MotionDrive):
                 self._homed = bool(m.get("homed", False))
                 self._xstate = m.get("state", "?")
                 self._pass = int(m.get("pass", -1))
-                if self._xstate in ("fault", "estop") or not m.get("estopOk", True):
+                self._progress = float(m.get("progress", 0.0))
+                self._line_hz = float(m.get("lineHz", 0.0))
+                self._filter_slot = int(m.get("filterSlot", -1))
+                self._estop_ok = bool(m.get("estopOk", True))
+                if self._xstate in ("fault", "estop") or not self._estop_ok:
                     self._state = DriveState.FAULT
                     self._fault = self._xstate
                 else:
@@ -145,10 +156,32 @@ class XylodDrive(MotionDrive):
                     self._mode = Mode.VELOCITY
                 else:
                     self._mode = Mode.POSITION
+        elif ev == "pass_start":
+            with self._lock:
+                self._pass = int(m.get("pass", -1))
+                self._pass_filter = m.get("filter", "")
+        elif ev == "seq_done":
+            with self._lock:
+                self._seq_passes = int(m.get("passes", 0))
+                self._pass_filter = ""
         elif ev == "fault":
             with self._lock:
                 self._state = DriveState.FAULT
                 self._fault = m.get("text", "fault")
+
+    # ---- Xylosome scan context (read by the bench when this backend runs) -----
+    def xylo_status(self) -> dict:
+        with self._lock:
+            return {
+                "xstate": self._xstate,
+                "pass": self._pass,
+                "filter": self._pass_filter,
+                "progress": self._progress,
+                "line_hz": self._line_hz,
+                "filter_slot": self._filter_slot,
+                "estop_ok": self._estop_ok,
+                "last_seq_passes": self._seq_passes,
+            }
 
     # ---- commanding (translated to xylod protocol) ---------------------------
     def enable(self) -> None:
@@ -185,13 +218,18 @@ class XylodDrive(MotionDrive):
     # ---- feedback -------------------------------------------------------------
     def status(self) -> DriveStatus:
         with self._lock:
+            # During a daemon-driven scan the bench isn't the commander — a flat
+            # zero "target" trace on the scope would be a lie. Mirror actual so
+            # the traces overlap (reads as: axis following its own plan).
+            scan = self._xstate in ("running", "paused", "settle", "filter", "moving")
+            tvel = self._deg2counts(self._vel_degs) if scan else self._target_vel
             return DriveStatus(
                 state=self._state,
                 mode=self._mode,
                 actual_position=self._deg2counts(self._pos_deg),
                 actual_velocity=self._deg2counts(self._vel_degs),
                 target_position=self._target_pos,
-                target_velocity=self._target_vel,
+                target_velocity=tvel,
                 homed=self._homed,
                 fault_text=self._fault,
             )

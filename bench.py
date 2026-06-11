@@ -254,10 +254,11 @@ class BenchWindow(QtWidgets.QMainWindow):
         self.lbl_pos = QtWidgets.QLabel("—")
         self.lbl_vel = QtWidgets.QLabel("—")
         self.lbl_homed = QtWidgets.QLabel("—")
+        self.lbl_xylo = QtWidgets.QLabel("—")    # Xylosome scan context (xylod backend)
         for i, (name, lbl) in enumerate([
             ("State", self.lbl_state), ("Mode", self.lbl_mode),
             ("Position", self.lbl_pos), ("Velocity", self.lbl_vel),
-            ("Homed", self.lbl_homed),
+            ("Homed", self.lbl_homed), ("Scan", self.lbl_xylo),
         ]):
             rl.addWidget(QtWidgets.QLabel(name), i, 0)
             f = lbl.font(); f.setPointSize(f.pointSize() + 2); f.setBold(True); lbl.setFont(f)
@@ -392,8 +393,31 @@ class BenchWindow(QtWidgets.QMainWindow):
 
         self.lbl_state.setText(s.state.value)
         self.lbl_mode.setText(s.mode.value)
-        self.lbl_pos.setText(f"{s.actual_position / self.limits.counts_per_rev:+.3f} rev")
-        self.lbl_vel.setText(f"{vel_rev:+.3f} rev/s")
+
+        xylo = isinstance(self.drive, XylodDrive)
+        if xylo:
+            # speak the instrument's language: output degrees, not revolutions
+            self.lbl_pos.setText(f"{s.actual_position / self.limits.counts_per_rev * 360.0:+.2f} deg")
+            self.lbl_vel.setText(f"{vel_rev * 360.0:+.1f} deg/s")
+            x = self.drive.xylo_status()
+            if x["xstate"] in ("running", "paused"):
+                self.lbl_xylo.setText(
+                    f"pass {x['pass'] + 1}/4 {x['filter']}  ·  {x['progress'] * 100:.0f}%"
+                    f"  ·  line {x['line_hz']:.0f} Hz"
+                    + ("  ·  PAUSED" if x["xstate"] == "paused" else ""))
+            elif x["xstate"] in ("filter", "settle", "moving"):
+                self.lbl_xylo.setText(f"{x['xstate']} …")
+            elif not x["estop_ok"]:
+                self.lbl_xylo.setText("E-STOP")
+            elif x["last_seq_passes"]:
+                self.lbl_xylo.setText(f"idle  ·  last scan {x['last_seq_passes']} passes")
+            else:
+                self.lbl_xylo.setText("idle")
+        else:
+            self.lbl_pos.setText(f"{s.actual_position / self.limits.counts_per_rev:+.3f} rev")
+            self.lbl_vel.setText(f"{vel_rev:+.3f} rev/s")
+            self.lbl_xylo.setText("—")
+
         self.lbl_homed.setText("yes" if s.homed else "no")
         color = {DriveState.ENABLED: theme.OK, DriveState.FAULT: theme.FAULT,
                  DriveState.DISABLED: theme.TEXT_DIM, DriveState.DISCONNECTED: theme.IDLE}
