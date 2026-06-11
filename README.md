@@ -70,3 +70,12 @@ The profile player here is the same idea as the Xylosome HMI curve editor: draw 
 velocity/position-vs-time shape, press play, the axis follows it. Prove it on the bench
 with the simulator now, swap in the real drive next, and this becomes the core of the
 Xylosome motion backend — nothing thrown away.
+
+## The dip between passes (do not "fix")
+
+After each scan pass the scope shows a negative-velocity dip the Pi never
+draws: the carriage return, the axis driving back to arc start. The pendant
+deliberately hides it (artist's view = intent); the bench deliberately shows
+it (desk view = physics). Its depth is the return speed, its width is the
+inter-pass dead time — and on real hardware a widening dip means mechanical
+drag before you can feel it. Verified and explicitly kept, 2026-06-10.
